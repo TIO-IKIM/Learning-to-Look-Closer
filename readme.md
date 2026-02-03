@@ -1,6 +1,6 @@
 # Learning to Look Closer: A New Instance-Wise Loss for Small Cerebral Lesion Segmentation
 
-This is the official implementation of our ISBI 2026 submission. The preprint is available [here](https://arxiv.org/abs/2511.17146).
+This is the official implementation of our ISBI 2026 paper. The arxiv version is available [here](https://arxiv.org/abs/2511.17146).
 
 ## Abstract 
 
@@ -14,8 +14,8 @@ existing blob loss. Both are benchmarked against a DiceCE
 baseline within the nnU-Net framework, which provides a
 robust and standardized setup. We find that CC-DiceCE loss
 increases detection (recall) with minimal to no degradation in
-segmentation performance, albeit at the cost of slightly more
-false positives. Furthermore, our multi-dataset study shows
+segmentation performance, though with dataset-dependent
+trade-offs in precision. Furthermore, our multi-dataset study shows
 that CC-DiceCE generally outperforms blob loss.
 
 ## Implementation
