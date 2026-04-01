@@ -1,6 +1,6 @@
 # Learning to Look Closer: A New Instance-Wise Loss for Small Cerebral Lesion Segmentation
 
-This is the official implementation of our ISBI 2026 paper. The arxiv version is available [here](https://arxiv.org/abs/2511.17146).
+This is the official implementation of our ISBI 2026 paper. The arXiv version is available [here](https://arxiv.org/abs/2511.17146).
 
 ## Abstract 
 
@@ -18,6 +18,30 @@ segmentation performance, though with dataset-dependent
 trade-offs in precision. Furthermore, our multi-dataset study shows
 that CC-DiceCE generally outperforms blob loss.
 
+## Using the custom trainers
+
+After planning and preprocessing your dataset, train with the desired custom trainer by passing `-tr` to `nnUNetv2_train`:
+
+```bash
+nnUNetv2_train DATASET 3d_fullres FOLD -tr TRAINER_NAME
+```
+
+Available trainer names:
+
+- `nnUNetTrainerCCDiceCE`: CC-DiceCE only.
+- `nnUNetTrainerBlobDiceCE`: blob loss only.
+- `nnUNetTrainerGlobalCCDiceCE`: CC-DiceCE combined with the standard global DiceCE term.
+- `nnUNetTrainerGlobalBlobDiceCE`: blob loss combined with the standard global DiceCE term.
+- `nnUNetTrainerDiceCEBaseline`: DiceCE (noSmooth) baseline implemented in the same trainer framework.
+
+Example:
+
+```bash
+nnUNetv2_train 004 3d_fullres 0 -tr nnUNetTrainerGlobalCCDiceCE
+```
+
+These trainers currently support binary segmentation only (`background + foreground`) and do not support region-based training or ignore labels.
+
 ## Implementation
 
 This implementation is based on nnU-Net and consists of three core files:
@@ -29,6 +53,10 @@ This implementation is based on nnU-Net and consists of three core files:
 ## Requirements 
 
 Install all dependencies listed in `pyproject.toml`, plus CuPy. See the [CuPy installation guide](https://docs.cupy.dev/en/stable/install.html#installing-cupy-from-pypi) to determine which version to install.
+
+## Original nnU-Net README
+
+The remainder of this document is the original nnU-Net README and is included here for reference.
 
 # Welcome to the new nnU-Net!
 
