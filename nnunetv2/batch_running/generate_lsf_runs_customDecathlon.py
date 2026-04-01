@@ -36,7 +36,9 @@ if __name__ == "__main__":
         220: ("2d", "3d_lowres", "3d_fullres", "3d_cascade_fullres"),
         # 221: ("2d", "3d_lowres", "3d_fullres", "3d_cascade_fullres"),
         223: ("2d", "3d_lowres", "3d_fullres", "3d_cascade_fullres"),
+        219: ("2d", "3d_fullres"),
         226: ("2d", "3d_fullres"),
+        219: ("2d", "3d_fullres"),
     }
 
     configurations_3d_fr_only = {
@@ -60,16 +62,15 @@ if __name__ == "__main__":
     resources = ""
     gpu_requirements = f"-gpu num={num_gpus}:j_exclusive=yes:gmem=23G"#gmodel=NVIDIAA100_PCIE_40GB"
     queue = "-q gpu-pro"
-    preamble = "\". /home/isensee/env_loading_scripts/continuous_performance_monitoring/load_env_torch210.sh && " # -L /bin/bash
+    preamble = "\". /home/isensee/env_loading_scripts/continuous_performance_monitoring/load_env_torch211.sh && " # -L /bin/bash
     train_command = 'nnUNetv2_train'
-
 
     folds = (0, )
     # use_this = configurations_2d_only
     use_this = configurations_3d_fr_only
     # use_this = merge(use_this, configurations_3d_c_only)
 
-    datasets = [3, 5, 8, 10, 17, 27, 55, 220, 223, 226]
+    datasets = [3, 5, 8, 10, 17, 27, 55, 220, 223, 226] #, 219]
     use_this = {i: use_this[i] for i in datasets}
 
     use_these_modules = {
@@ -89,6 +90,9 @@ if __name__ == "__main__":
         # 'nnUNetTrainer_fasterDA': ('nnUNetPlans', 'nnUNetResEncUNetLPlans'),
         # 'nnUNetTrainer_noDummy2DDA': ('nnUNetResEncUNetMPlans', ),
         'nnUNetTrainer': ('nnUNetResEncUNetLPlans', ),
+        # 'nnUNetTrainerDA5': ('nnUNetResEncUNetMPlans', ),
+        # 'nnUNetTrainer_DASegOrd0': ('nnUNetResEncUNetMPlans',),
+        # 'nnUNetTrainerDA5Segord0': ('nnUNetResEncUNetMPlans',),
         # 'nnUNetTrainer_probabilisticOversampling_033': ('nnUNetResEncUNetMPlans', ),
         # 'nnUNetTrainer_probabilisticOversampling_010': ('nnUNetResEncUNetMPlans',),
         # BN

@@ -40,7 +40,12 @@ from torch import autocast, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
-from torch import GradScaler
+try:
+   from torch import GradScaler           # torch >= 2.3
+   TORCH_HAS_OLD_GRADSCALER = False
+except ImportError:
+   from torch.cuda.amp import GradScaler  # torch < 2.3
+   TORCH_HAS_OLD_GRADSCALER = True
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
@@ -52,7 +57,7 @@ from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
 from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
-from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
+from nnunetv2.training.logging.nnunet_logger import MetaLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
@@ -112,6 +117,8 @@ class nnUNetTrainer(object):
             self.my_init_kwargs[k] = locals()[k]
 
         ###  Saving all the init args into class variables for later access
+        continue_training = plans.pop("continue_training")
+        logger_config = {"plans": plans, "configuration": configuration, "fold": fold, "dataset": dataset_json}
         self.plans_manager = PlansManager(plans)
         self.configuration_manager = self.plans_manager.get_configuration(configuration)
         self.configuration_name = configuration
@@ -160,7 +167,7 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
+        self.grad_scaler = (GradScaler("cuda") if not TORCH_HAS_OLD_GRADSCALER else GradScaler()) if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -171,7 +178,8 @@ class nnUNetTrainer(object):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
+        self.logger = MetaLogger(self.output_folder, continue_training)
+        self.logger.update_config(logger_config)
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -233,6 +241,19 @@ class nnUNetTrainer(object):
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
             self.was_initialized = True
+
+            logger_config_hparas = {
+                "initial_lr": self.initial_lr,
+                "weight_decay": self.weight_decay,
+                "oversample_foreground_percent": self.oversample_foreground_percent,
+                "probabilistic_oversampling": self.probabilistic_oversampling,
+                "num_iterations_per_epoch": self.num_iterations_per_epoch,
+                "num_val_iterations_per_epoch": self.num_val_iterations_per_epoch,
+                "num_epochs": self.num_epochs,
+                "enable_deep_supervision": self.enable_deep_supervision,
+                "batch_size": self.configuration_manager.batch_size
+                }
+            self.logger.update_config({"hparas": logger_config_hparas})
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
@@ -279,12 +300,18 @@ class nnUNetTrainer(object):
                         # print(k)
                         pass
                 if k in ['dataloader_train', 'dataloader_val']:
-                    if hasattr(getattr(self, k), 'generator'):
-                        dct[k + '.generator'] = str(getattr(self, k).generator)
-                    if hasattr(getattr(self, k), 'num_processes'):
-                        dct[k + '.num_processes'] = str(getattr(self, k).num_processes)
-                    if hasattr(getattr(self, k), 'transform'):
-                        dct[k + '.transform'] = str(getattr(self, k).transform)
+                    dl = getattr(self, k)
+                    if hasattr(dl, 'generator'):
+                        dct[k + '.generator'] = str(dl.generator)
+                        if hasattr(dl.generator, 'transforms'):
+                            try:
+                                dct[k + '.generator.transforms'] = str(dl.generator.transforms)
+                            except Exception as e:
+                                dct[k + '.generator.transforms'] = f"Could not stringify generator.transforms: {type(e).__name__}: {e}"
+                    if hasattr(dl, 'num_processes'):
+                        dct[k + '.num_processes'] = str(dl.num_processes)
+                    if hasattr(dl, 'transform'):
+                        dct[k + '.transform'] = str(dl.transform)
             import subprocess
             hostname = subprocess.getoutput(['hostname'])
             dct['hostname'] = hostname
@@ -656,7 +683,6 @@ class nnUNetTrainer(object):
                                                         ignore_label=self.label_manager.ignore_label)
 
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-
         dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
                                  initial_patch_size,
                                  self.configuration_manager.patch_size,
@@ -717,7 +743,9 @@ class nnUNetTrainer(object):
                 patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
                 p_rotation=0.2,
                 rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False  # , mode_seg='nearest'
+                bg_style_seg_sampling=False,
+                border_mode_seg='constant',
+                padding_value_seg=-1,
             )
         )
 
@@ -1123,12 +1151,12 @@ class nnUNetTrainer(object):
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('train_loss', np.round(self.logger.get_value('train_losses', step=-1), decimals=4))
+        self.print_to_log_file('val_loss', np.round(self.logger.get_value('val_losses', step=-1), decimals=4))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
-                                               self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
+                                               self.logger.get_value('dice_per_class_or_region', step=-1)])
         self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
+            f"Epoch time: {np.round(self.logger.get_value('epoch_end_timestamps', step=-1) - self.logger.get_value('epoch_start_timestamps', step=-1), decimals=2)} s")
 
         # handling periodic checkpointing
         current_epoch = self.current_epoch
@@ -1136,8 +1164,8 @@ class nnUNetTrainer(object):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        if self._best_ema is None or self.logger.get_value('ema_fg_dice', step=-1) > self._best_ema:
+            self._best_ema = self.logger.get_value('ema_fg_dice', step=-1)
             self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
@@ -1294,8 +1322,10 @@ class nnUNetTrainer(object):
                     )
                 )
                 # for debug purposes
-                # export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
-                #      self.dataset_json, output_filename_truncated, save_probabilities)
+                # export_prediction_from_logits(
+                #     prediction, properties, self.configuration_manager, self.plans_manager,
+                #      self.dataset_json, output_filename_truncated, save_probabilities
+                # )
 
                 # if needed, export the softmax prediction for the next stage
                 if next_stages is not None:
@@ -1356,6 +1386,9 @@ class nnUNetTrainer(object):
                                                 self.label_manager.ignore_label, chill=True,
                                                 num_processes=default_num_processes * dist.get_world_size() if
                                                 self.is_ddp else default_num_processes)
+            for label in metrics["mean"]:
+                self.logger.log_summary(f"final_val/class_{label}_dice", metrics["mean"][label]["Dice"])
+            self.logger.log_summary("final_val/foreground_dice", metrics['foreground_mean']["Dice"])
             self.print_to_log_file("Validation complete", also_print_to_console=True)
             self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
                                    also_print_to_console=True)
