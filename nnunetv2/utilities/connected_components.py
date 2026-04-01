@@ -1,5 +1,4 @@
 import torch
-from torch.utils import dlpack as torch_dlpack
 
 try:
     import cupy as cp  # type: ignore
@@ -19,7 +18,7 @@ def _torch_tensor_to_cupy(tensor: torch.Tensor) -> "cp.ndarray":
     if tensor.device.type != "cuda":
         raise ValueError("connected components expect CUDA tensors for CuPy execution.")
     tensor = tensor.contiguous()
-    return cp.from_dlpack(torch_dlpack.to_dlpack(tensor))
+    return cp.from_dlpack(tensor)
 
 
 def _ensure_cupy_array(array_like) -> "cp.ndarray":
@@ -33,7 +32,7 @@ def _ensure_cupy_array(array_like) -> "cp.ndarray":
 
 
 def _cupy_array_to_torch(array: "cp.ndarray", *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    tensor = torch_dlpack.from_dlpack(array.toDlpack())
+    tensor = torch.from_dlpack(array)
 
     if tensor.device != device:
         tensor = tensor.to(device=device)

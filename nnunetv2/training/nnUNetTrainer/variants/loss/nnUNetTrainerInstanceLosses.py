@@ -9,7 +9,10 @@ from torch import nn
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
-from nnunetv2.training.loss.instance_losses import BlobLoss, CCMetrics
+from nnunetv2.training.loss.instance_losses import (
+    VectorizedBlobLoss,
+    VectorizedCCLoss,
+)
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.git_logging import log_git_context
 from nnunetv2.utilities.helpers import softmax_helper_dim1
@@ -64,36 +67,6 @@ def integrate_deep_supervision(trainer: nnUNetTrainer, loss: nn.Module) -> nn.Mo
 
     weights /= weights.sum()
     return DeepSupervisionWrapper(loss, weights)
-
-
-def _safe_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    mask_sum = mask.sum()
-    if mask_sum <= 0:
-        return torch.zeros((), device=value.device, dtype=value.dtype)
-    return (value * mask).sum() / mask_sum
-
-
-def _component_dice_ce_loss(
-    y_pred: torch.Tensor,
-    y_true: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    eps = 1e-7
-
-    yp = y_pred.to(torch.float32)
-    yt = y_true.to(torch.float32)
-
-    foreground_pred = yp[1]
-    foreground_true = yt[1]
-
-    intersection = (foreground_pred * foreground_true).sum()
-    denominator = (foreground_pred.sum() + foreground_true.sum()).clamp_min(eps)
-    dice_loss = 1.0 - (2.0 * intersection / denominator)
-
-    log_probs = torch.log(yp.clamp_min(eps))
-    ce_map = -(yt * log_probs).sum(dim=0)
-
-    return dice_loss + _safe_mean(ce_map, mask)
 
 
 def _build_global_dc_ce_loss(trainer: nnUNetTrainer) -> nn.Module:
@@ -164,6 +137,9 @@ class _InstanceTrainerBase(nnUNetTrainer):
 
     def _build_instance_loss(self) -> nn.Module:
         raise NotImplementedError
+    
+    def _build_global_loss(self) -> nn.Module:
+        return _build_global_dc_ce_loss(self)
 
     def _build_loss(self) -> nn.Module:  # type: ignore[override]
         _assert_instance_loss_prerequisites(self)
@@ -175,7 +151,7 @@ class _InstanceTrainerBase(nnUNetTrainer):
             components.append(("instance", instance_loss, self.instance_component_weight))
 
         if self.include_global_component:
-            global_loss = _build_global_dc_ce_loss(self).to(self.device)
+            global_loss = self._build_global_loss().to(self.device)
             components.append(("global", global_loss, self.global_component_weight))
 
         assert components, "At least one loss component must be active"
@@ -187,8 +163,6 @@ class _InstanceTrainerBase(nnUNetTrainer):
 
         final_loss = integrate_deep_supervision(self, final_loss)
         final_loss = final_loss.to(self.device)
-        if self._do_i_compile():
-            final_loss = torch.compile(final_loss)
         return final_loss
 
 
@@ -197,7 +171,7 @@ class nnUNetTrainerCCDiceCE(_InstanceTrainerBase):
     use_instance_loss = True
 
     def _build_instance_loss(self) -> nn.Module:
-        cc_loss = CCMetrics(metric=_component_dice_ce_loss, activation=softmax_helper_dim1)
+        cc_loss = VectorizedCCLoss(activation=softmax_helper_dim1, mode="dice_ce")
         return cc_loss
 
 
@@ -206,7 +180,7 @@ class nnUNetTrainerBlobDiceCE(_InstanceTrainerBase):
     use_instance_loss = True
 
     def _build_instance_loss(self) -> nn.Module:
-        blob_loss = BlobLoss(metric=_component_dice_ce_loss, activation=softmax_helper_dim1)
+        blob_loss = VectorizedBlobLoss(activation=softmax_helper_dim1, mode="dice_ce")
         return blob_loss
 
 
@@ -215,7 +189,7 @@ class nnUNetTrainerGlobalCCDiceCE(_InstanceTrainerBase):
     use_instance_loss = True
 
     def _build_instance_loss(self) -> nn.Module:
-        cc_loss = CCMetrics(metric=_component_dice_ce_loss, activation=softmax_helper_dim1)
+        cc_loss = VectorizedCCLoss(activation=softmax_helper_dim1, mode="dice_ce")
         return cc_loss
 
 
@@ -224,9 +198,9 @@ class nnUNetTrainerGlobalBlobDiceCE(_InstanceTrainerBase):
     use_instance_loss = True
 
     def _build_instance_loss(self) -> nn.Module:
-        blob_loss = BlobLoss(metric=_component_dice_ce_loss, activation=softmax_helper_dim1)
+        blob_loss = VectorizedBlobLoss(activation=softmax_helper_dim1, mode="dice_ce")
         return blob_loss
-    
+
 class nnUNetTrainerDiceCEBaseline(_InstanceTrainerBase):
     include_global_component = True
     use_instance_loss = False

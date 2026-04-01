@@ -1,7 +1,21 @@
+import os
 import torch
 import torch.nn.functional as F
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
+from torch.func import vmap
 from nnunetv2.utilities.connected_components import get_voronoi, get_cc
+
+VectorizedLossMode = Literal["dice", "ce", "dice_ce"]
+
+
+def _should_compile_vectorized_reduction() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if os.name == "nt":
+        return False
+    if "nnUNet_compile" not in os.environ:
+        return True
+    return os.environ["nnUNet_compile"].lower() in ("true", "1", "t")
 
 class _BaseConnectedComponentLoss(torch.nn.Module):
     """Shared forward logic for losses operating on connected components."""
@@ -105,6 +119,365 @@ class BlobLoss(_BaseConnectedComponentLoss):
         self, component_id: int, components: torch.Tensor
     ) -> torch.Tensor:
         return (components == component_id) | (components == 0)
+
+
+class _BaseVectorizedLoss(_BaseConnectedComponentLoss):
+    """Specialized reduction path that avoids per-component masking loops."""
+
+    def __init__(self, activation, mode: VectorizedLossMode) -> None:
+        super().__init__(metric=None, activation=activation)
+        if mode not in ("dice", "ce", "dice_ce"):
+            raise ValueError(f"Unsupported vectorized loss mode: {mode}")
+        self.mode = mode
+
+    def forward(self, y_pred, y):
+        self._validate_inputs(y_pred, y)
+
+        y_one_hot = self._one_hot_encode(y_pred, y)
+        components = self._compute_components(y_one_hot)
+
+        self._validate_components(y_pred, y_one_hot, components)
+
+        return self._vectorized_loss(y_pred, y, components)
+
+    def _vectorized_loss(
+        self,
+        y_pred: torch.Tensor,
+        y: torch.Tensor,
+        components: torch.Tensor,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class VectorizedCCLoss(_BaseVectorizedLoss):
+    """Vectorized connected-component loss for binary instance segmentation.
+
+    This is the fast path for Voronoi-based CC supervision. Each voxel belongs
+    to exactly one connected component, so we can flatten the volume and use a
+    segmented reduction instead of looping over component ids and building a
+    full-volume mask for every component.
+
+    The implementation supports the following static modes:
+    - ``"dice"``: foreground Dice loss only
+    - ``"ce"``: mean cross-entropy over each component
+    - ``"dice_ce"``: sum of the two terms above
+
+    Notes
+    -----
+    ``components`` is expected to be a dense Voronoi map with ids in
+    ``{0, 1, ..., K}``, where ``0`` denotes the empty-component fallback case
+    and ``1..K`` are the foreground instances. Reduction is vmapped over the
+    batch and uses fixed ``K + 1`` bins per sample, with bin ``0`` reserved for
+    background / empty handling.
+    """
+    def __init__(self, activation, mode: VectorizedLossMode = "dice_ce") -> None:
+        super().__init__(activation=activation, mode=mode)
+
+    def _compute_components(self, y: torch.Tensor) -> torch.Tensor:
+        voronoi = get_voronoi(y, do_bg=False)
+        return voronoi[:, 0, ...]
+
+    def _masking_fn(
+        self, component_id: int, components: torch.Tensor
+    ) -> torch.Tensor:
+        raise NotImplementedError("VectorizedCCLoss does not use masking_fn")
+
+    def _vectorized_loss(
+        self,
+        y_pred: torch.Tensor,
+        y: torch.Tensor,
+        components: torch.Tensor,
+    ) -> torch.Tensor:
+        return _vectorized_cc_loss(y_pred, y, components, self.activation, self.mode)
+
+
+class VectorizedBlobLoss(_BaseVectorizedLoss):
+    """Vectorized blob loss for binary instance segmentation.
+
+    This is the fast path for connected-component blob supervision. Unlike the
+    CC/Voronoi case, the loss region for component ``k`` is not just that
+    component, but ``background union component_k``. Because background voxels
+    participate in every component loss, the reduction is split into:
+    - one shared background bin
+    - one bin per foreground component
+
+    Final per-component Dice / CE terms are then assembled algebraically as:
+    ``background contribution + component contribution``.
+
+    The implementation supports the following static modes:
+    - ``"dice"``: foreground Dice loss only
+    - ``"ce"``: mean cross-entropy over each blob region
+    - ``"dice_ce"``: sum of the two terms above
+
+    This keeps the same semantics as the original BlobLoss implementation while
+    avoiding per-component boolean mask materialization.
+    """
+    def __init__(self, activation, mode: VectorizedLossMode = "dice_ce") -> None:
+        super().__init__(activation=activation, mode=mode)
+
+    def _compute_components(self, y: torch.Tensor) -> torch.Tensor:
+        connected_components = get_cc(y, do_bg=False)
+        return connected_components[:, 0, ...]
+
+    def _masking_fn(
+        self, component_id: int, components: torch.Tensor
+    ) -> torch.Tensor:
+        raise NotImplementedError("VectorizedBlobLoss does not use masking_fn")
+
+    def _vectorized_loss(
+        self,
+        y_pred: torch.Tensor,
+        y: torch.Tensor,
+        components: torch.Tensor,
+    ) -> torch.Tensor:
+        return _vectorized_blob_loss(y_pred, y, components, self.activation, self.mode)
+
+
+def _scatter_segment_sum(
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+) -> torch.Tensor:
+    out = torch.zeros(num_segments, device=values.device, dtype=values.dtype)
+    return torch.scatter_add(out, 0, segment_ids, values)
+
+
+def _combine_vectorized_loss_terms(
+    *,
+    mode: VectorizedLossMode,
+    intersection: Optional[torch.Tensor] = None,
+    pred_sum: Optional[torch.Tensor] = None,
+    true_sum: Optional[torch.Tensor] = None,
+    ce_sum: Optional[torch.Tensor] = None,
+    count: Optional[torch.Tensor] = None,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    if mode == "dice":
+        assert intersection is not None and pred_sum is not None and true_sum is not None
+        return 1.0 - (2.0 * intersection / (pred_sum + true_sum).clamp_min(eps))
+    if mode == "ce":
+        assert ce_sum is not None and count is not None
+        return ce_sum / count.clamp_min(1.0)
+
+    assert intersection is not None and pred_sum is not None and true_sum is not None
+    assert ce_sum is not None and count is not None
+    dice_loss = 1.0 - (2.0 * intersection / (pred_sum + true_sum).clamp_min(eps))
+    ce_loss = ce_sum / count.clamp_min(1.0)
+    return dice_loss + ce_loss
+
+
+def _whole_volume_fallback_loss(
+    *,
+    mode: VectorizedLossMode,
+    foreground_pred: torch.Tensor,
+    foreground_true: torch.Tensor,
+    ce_map: Optional[torch.Tensor] = None,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    if mode == "dice":
+        return foreground_pred.new_tensor(1.0)
+    if mode == "ce":
+        assert ce_map is not None
+        return ce_map.mean()
+
+    assert ce_map is not None
+    return ce_map.mean() + 1.0
+
+
+# Keep the wrapper eager: it performs CuPy work and extracts a Python scalar for
+# num_component_slots. Meaning it inserts graph breaks and thus compiling it is
+# not worth it.
+@torch.compiler.disable
+def _vectorized_cc_loss(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+    components: torch.Tensor,
+    activation: Optional[Callable],
+    mode: VectorizedLossMode,
+) -> torch.Tensor:
+    eps = 1e-7
+    probs = activation(y_pred) if activation is not None else y_pred
+    probs_f32 = probs.to(torch.float32)
+    target = y[:, 0].long()
+    num_component_slots = max(1, int(components.max().item()))
+    foreground_pred = probs_f32[:, 1]
+    foreground_true = (target == 1).to(torch.float32)
+    ce_map = -torch.log(probs_f32.clamp_min(eps)).gather(1, target.unsqueeze(1)).squeeze(1)
+    return _compiled_vectorized_cc_reduction(
+        foreground_pred,
+        foreground_true,
+        ce_map,
+        components,
+        mode,
+        num_component_slots,
+    )
+
+
+def _vectorized_cc_reduction(
+    foreground_pred: torch.Tensor,
+    foreground_true: torch.Tensor,
+    ce_map: torch.Tensor,
+    components: torch.Tensor,
+    mode: VectorizedLossMode,
+    num_component_slots: int,
+) -> torch.Tensor:
+    eps = 1e-7
+
+    def per_sample_loss(
+        sample_foreground_pred: torch.Tensor,
+        sample_foreground_true: torch.Tensor,
+        sample_ce_map: torch.Tensor,
+        sample_components: torch.Tensor,
+    ) -> torch.Tensor:
+        component_ids = sample_components.long().reshape(-1)
+        num_slots_with_bg = num_component_slots + 1
+
+        def segment_sum(values: torch.Tensor) -> torch.Tensor:
+            return _scatter_segment_sum(
+                values.reshape(-1),
+                component_ids,
+                num_slots_with_bg,
+            )
+
+        intersection = segment_sum(sample_foreground_pred * sample_foreground_true)[1:]
+        pred_sum = segment_sum(sample_foreground_pred)[1:]
+        true_sum = segment_sum(sample_foreground_true)[1:]
+        ce_sum = segment_sum(sample_ce_map)[1:]
+        count = segment_sum(torch.ones_like(sample_foreground_pred))[1:]
+        component_loss = _combine_vectorized_loss_terms(
+            mode=mode,
+            intersection=intersection,
+            pred_sum=pred_sum,
+            true_sum=true_sum,
+            ce_sum=ce_sum,
+            count=count,
+            eps=eps,
+        )
+
+        valid_components = count > 0
+        valid_components_f = valid_components.to(component_loss.dtype)
+        cc_loss = (
+            (component_loss * valid_components_f).sum()
+            / valid_components_f.sum().clamp_min(1.0)
+        )
+        fallback = _whole_volume_fallback_loss(
+            mode=mode,
+            foreground_pred=sample_foreground_pred,
+            foreground_true=sample_foreground_true,
+            ce_map=sample_ce_map,
+            eps=eps,
+        )
+        return torch.where(valid_components.any(), cc_loss, fallback)
+
+    per_sample = vmap(per_sample_loss, in_dims=(0, 0, 0, 0))(
+        foreground_pred, foreground_true, ce_map, components
+    )
+    return per_sample.mean()
+
+
+# Keep the wrapper eager: it performs CuPy work and extracts a Python scalar for
+# num_component_slots. Meaning it inserts graph breaks and thus compiling it is
+# not worth it.
+@torch.compiler.disable
+def _vectorized_blob_loss(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+    components: torch.Tensor,
+    activation: Optional[Callable],
+    mode: VectorizedLossMode,
+) -> torch.Tensor:
+    eps = 1e-7
+    probs = activation(y_pred) if activation is not None else y_pred
+    probs_f32 = probs.to(torch.float32)
+    target = y[:, 0].long()
+    num_component_slots = max(1, int(components.max().item()))
+    foreground_pred = probs_f32[:, 1]
+    foreground_true = (target == 1).to(torch.float32)
+    ce_map = -torch.log(probs_f32.clamp_min(eps)).gather(1, target.unsqueeze(1)).squeeze(1)
+    return _compiled_vectorized_blob_reduction(
+        foreground_pred,
+        foreground_true,
+        ce_map,
+        components,
+        mode,
+        num_component_slots,
+    )
+
+
+def _vectorized_blob_reduction(
+    foreground_pred: torch.Tensor,
+    foreground_true: torch.Tensor,
+    ce_map: torch.Tensor,
+    components: torch.Tensor,
+    mode: VectorizedLossMode,
+    num_component_slots: int,
+) -> torch.Tensor:
+    eps = 1e-7
+
+    def per_sample_loss(
+        sample_foreground_pred: torch.Tensor,
+        sample_foreground_true: torch.Tensor,
+        sample_ce_map: torch.Tensor,
+        sample_components: torch.Tensor,
+    ) -> torch.Tensor:
+        component_ids = sample_components.long().reshape(-1)
+        num_slots_with_bg = num_component_slots + 1
+
+        def segment_sum(values: torch.Tensor) -> torch.Tensor:
+            return _scatter_segment_sum(
+                values.reshape(-1),
+                component_ids,
+                num_slots_with_bg,
+            )
+
+        intersection_bins = segment_sum(sample_foreground_pred * sample_foreground_true)
+        pred_bins = segment_sum(sample_foreground_pred)
+        true_bins = segment_sum(sample_foreground_true)
+        ce_bins = segment_sum(sample_ce_map)
+        count_bins = segment_sum(torch.ones_like(sample_foreground_pred))
+
+        intersection = intersection_bins[0] + intersection_bins[1:]
+        pred_sum = pred_bins[0] + pred_bins[1:]
+        true_sum = true_bins[0] + true_bins[1:]
+        ce_sum = ce_bins[0] + ce_bins[1:]
+        count = count_bins[0] + count_bins[1:]
+        component_loss = _combine_vectorized_loss_terms(
+            mode=mode,
+            intersection=intersection,
+            pred_sum=pred_sum,
+            true_sum=true_sum,
+            ce_sum=ce_sum,
+            count=count,
+            eps=eps,
+        )
+
+        valid_components = count_bins[1:] > 0
+        valid_components_f = valid_components.to(component_loss.dtype)
+        blob_loss = (
+            (component_loss * valid_components_f).sum()
+            / valid_components_f.sum().clamp_min(1.0)
+        )
+        fallback = _whole_volume_fallback_loss(
+            mode=mode,
+            foreground_pred=sample_foreground_pred,
+            foreground_true=sample_foreground_true,
+            ce_map=sample_ce_map,
+            eps=eps,
+        )
+        return torch.where(valid_components.any(), blob_loss, fallback)
+
+    per_sample = vmap(per_sample_loss, in_dims=(0, 0, 0, 0))(
+        foreground_pred, foreground_true, ce_map, components
+    )
+    return per_sample.mean()
+
+
+if _should_compile_vectorized_reduction():
+    _compiled_vectorized_cc_reduction = torch.compile(_vectorized_cc_reduction)
+    _compiled_vectorized_blob_reduction = torch.compile(_vectorized_blob_reduction)
+else:
+    _compiled_vectorized_cc_reduction = _vectorized_cc_reduction
+    _compiled_vectorized_blob_reduction = _vectorized_blob_reduction
 
 
 def per_channel_cc(
