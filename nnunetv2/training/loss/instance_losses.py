@@ -43,7 +43,6 @@ class _BaseConnectedComponentLoss(torch.nn.Module):
             activation=self.activation,
         )
 
-    # Helpers
     def _validate_inputs(self, y_pred: torch.Tensor, y: torch.Tensor) -> None:
         cls_name = self.__class__.__name__
 
@@ -83,7 +82,6 @@ class _BaseConnectedComponentLoss(torch.nn.Module):
             list(components.shape) == expected_shape
         ), f"Expected connected components with shape [B,H,W,D], but got {tuple(components.shape)}"
 
-    # Abstract hooks
     def _compute_components(self, y: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -188,7 +186,14 @@ class VectorizedCCLoss(_BaseVectorizedLoss):
         y: torch.Tensor,
         components: torch.Tensor,
     ) -> torch.Tensor:
-        return _vectorized_cc_loss(y_pred, y, components, self.activation, self.mode)
+        return _vectorized_loss(
+            y_pred,
+            y,
+            components,
+            self.activation,
+            self.mode,
+            _compiled_vectorized_cc_reduction,
+        )
 
 
 class VectorizedBlobLoss(_BaseVectorizedLoss):
@@ -230,7 +235,14 @@ class VectorizedBlobLoss(_BaseVectorizedLoss):
         y: torch.Tensor,
         components: torch.Tensor,
     ) -> torch.Tensor:
-        return _vectorized_blob_loss(y_pred, y, components, self.activation, self.mode)
+        return _vectorized_loss(
+            y_pred,
+            y,
+            components,
+            self.activation,
+            self.mode,
+            _compiled_vectorized_blob_reduction,
+        )
 
 
 def _scatter_segment_sum(
@@ -284,17 +296,12 @@ def _whole_volume_fallback_loss(
     return ce_map.mean() + 1.0
 
 
-# Keep the wrapper eager: it performs CuPy work and extracts a Python scalar for
-# num_component_slots. Meaning it inserts graph breaks and thus compiling it is
-# not worth it.
-@torch.compiler.disable
-def _vectorized_cc_loss(
+def _prepare_vectorized_loss_inputs(
     y_pred: torch.Tensor,
     y: torch.Tensor,
     components: torch.Tensor,
     activation: Optional[Callable],
-    mode: VectorizedLossMode,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     eps = 1e-7
     probs = activation(y_pred) if activation is not None else y_pred
     probs_f32 = probs.to(torch.float32)
@@ -303,7 +310,28 @@ def _vectorized_cc_loss(
     foreground_pred = probs_f32[:, 1]
     foreground_true = (target == 1).to(torch.float32)
     ce_map = -torch.log(probs_f32.clamp_min(eps)).gather(1, target.unsqueeze(1)).squeeze(1)
-    return _compiled_vectorized_cc_reduction(
+    return foreground_pred, foreground_true, ce_map, num_component_slots
+
+
+# Keep the wrapper eager: it performs CuPy work and extracts a Python scalar for
+# num_component_slots. Meaning it inserts graph breaks and thus compiling it is
+# not worth it.
+@torch.compiler.disable
+def _vectorized_loss(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+    components: torch.Tensor,
+    activation: Optional[Callable],
+    mode: VectorizedLossMode,
+    compiled_fn: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, VectorizedLossMode, int],
+        torch.Tensor,
+    ],
+) -> torch.Tensor:
+    foreground_pred, foreground_true, ce_map, num_component_slots = (
+        _prepare_vectorized_loss_inputs(y_pred, y, components, activation)
+    )
+    return compiled_fn(
         foreground_pred,
         foreground_true,
         ce_map,
@@ -373,36 +401,6 @@ def _vectorized_cc_reduction(
         foreground_pred, foreground_true, ce_map, components
     )
     return per_sample.mean()
-
-
-# Keep the wrapper eager: it performs CuPy work and extracts a Python scalar for
-# num_component_slots. Meaning it inserts graph breaks and thus compiling it is
-# not worth it.
-@torch.compiler.disable
-def _vectorized_blob_loss(
-    y_pred: torch.Tensor,
-    y: torch.Tensor,
-    components: torch.Tensor,
-    activation: Optional[Callable],
-    mode: VectorizedLossMode,
-) -> torch.Tensor:
-    eps = 1e-7
-    probs = activation(y_pred) if activation is not None else y_pred
-    probs_f32 = probs.to(torch.float32)
-    target = y[:, 0].long()
-    num_component_slots = max(1, int(components.max().item()))
-    foreground_pred = probs_f32[:, 1]
-    foreground_true = (target == 1).to(torch.float32)
-    ce_map = -torch.log(probs_f32.clamp_min(eps)).gather(1, target.unsqueeze(1)).squeeze(1)
-    return _compiled_vectorized_blob_reduction(
-        foreground_pred,
-        foreground_true,
-        ce_map,
-        components,
-        mode,
-        num_component_slots,
-    )
-
 
 def _vectorized_blob_reduction(
     foreground_pred: torch.Tensor,
@@ -545,7 +543,6 @@ def binary_cc(
         metric: Callable applied to each component; should accept ``(masked_pred, masked_true, mask)`` tensors.
         activation: Optional callable applied to ``y_pred`` before metric evaluation.
     """
-    # Sanity checks
     assert y_pred.shape == y.shape, "All inputs must match in shape"
     assert y.ndim == 5, "Expect [B, 2, H, W, D]"
     assert y.shape[1] == 2, "This is for binary inputs only"
@@ -553,17 +550,18 @@ def binary_cc(
     assert y.dtype in (torch.float16, torch.bfloat16, torch.float32)
     assert y_pred.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
-    # Optional activation
     if activation is not None:
         y_pred = activation(y_pred)
 
     B = y_pred.shape[0]
     sample_scores: list[torch.Tensor] = []
 
+    # Instead of vmap, loop over the batch
     for i in range(B):
         score = per_channel_cc(y_pred[i], y[i], components[i], metric, masking_fn)
         sample_scores.append(score)
 
+    # Stack the results into a tensor (if that's what vmap was producing)
     scores = torch.stack(sample_scores, dim=0)
 
     return scores.mean()
