@@ -7,6 +7,12 @@ from nnunetv2.utilities.connected_components import get_voronoi, get_cc
 
 VectorizedLossMode = Literal["dice", "ce", "dice_ce"]
 
+if hasattr(torch, "_dynamo"):
+    if hasattr(torch._dynamo.config, "recompile_limit"):
+        torch._dynamo.config.recompile_limit = 128
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = 128
+
 
 def _should_compile_vectorized_reduction() -> bool:
     if not torch.cuda.is_available():
