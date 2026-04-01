@@ -49,7 +49,9 @@ dependencies = [
     "seaborn",
     "imagecodecs",
     "yacs",
-    "batchgeneratorsv2>=0.3.0",
+    # FIXME revert to a normal version constraint once upstream requires a
+    # batchgeneratorsv2 release that includes commit 1272f77.
+    "batchgeneratorsv2 @ git+https://github.com/MIC-DKFZ/batchgeneratorsv2.git@1272f7797bdff3b46e0043a11023cb7f681f3859",
     "einops",
     "blosc2>=3.0.0b1",
     "GitPython",
