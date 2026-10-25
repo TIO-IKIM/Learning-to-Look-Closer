@@ -174,11 +174,35 @@ class VectorizedCCLoss(_BaseVectorizedLoss):
     batch and uses fixed ``K + 1`` bins per sample, with bin ``0`` reserved for
     background / empty handling.
     """
-    def __init__(self, activation, mode: VectorizedLossMode = "dice_ce") -> None:
+    def __init__(self, activation, mode: VectorizedLossMode = "dice_ce",
+                 sampling=None, patch_size=None) -> None:
         super().__init__(activation=activation, mode=mode)
+        self.sampling = None if sampling is None else tuple(float(i) for i in sampling)
+        self.patch_size = None if patch_size is None else tuple(int(i) for i in patch_size)
+        if self.sampling is not None and any(i <= 0 for i in self.sampling):
+            raise ValueError("sampling values must be positive")
+        if self.patch_size is not None and any(i <= 0 for i in self.patch_size):
+            raise ValueError("patch_size values must be positive")
+
+    def _effective_sampling(self, spatial_shape):
+        """Scale spacing to the current deep-supervision resolution."""
+        if self.sampling is None:
+            return None
+        if len(self.sampling) != len(spatial_shape):
+            raise ValueError("sampling must have one entry per spatial dimension")
+        if self.patch_size is None:
+            return self.sampling
+        if len(self.patch_size) != len(spatial_shape):
+            raise ValueError("patch_size must have one entry per spatial dimension")
+        return tuple(
+            spacing * full_size / current_size
+            for spacing, full_size, current_size in zip(
+                self.sampling, self.patch_size, spatial_shape
+            )
+        )
 
     def _compute_components(self, y: torch.Tensor) -> torch.Tensor:
-        voronoi = get_voronoi(y, do_bg=False)
+        voronoi = get_voronoi(y, do_bg=False, sampling=self._effective_sampling(y.shape[2:]))
         return voronoi[:, 0, ...]
 
     def _masking_fn(

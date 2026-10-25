@@ -80,13 +80,14 @@ def get_cc(y: torch.Tensor, do_bg: bool):
 
 
 def get_voronoi(
-    y: torch.Tensor, do_bg: bool,
+    y: torch.Tensor, do_bg: bool, sampling=None,
 ) -> torch.Tensor:
     """Compute per-channel Voronoi maps around foreground components on the GPU.
 
     Args:
         y: One-hot tensor with foreground channels, shaped ``[B, C, D, H, W]``.
         do_bg: Whether to keep the background channel in the output structure.
+        sampling: Physical voxel spacing in spatial tensor order; None uses unit spacing.
     """
     assert y.ndim == 5
 
@@ -97,7 +98,7 @@ def get_voronoi(
             if not _HAS_CUPY:
                 raise RuntimeError("CuPy with CUDA support is required for Voronoi computation.") from _CUPY_IMPORT_ERROR
             mask = y[batch_index, channel_index] > 0
-            voronoi_gpu = compute_voronoi_cupy(mask)
+            voronoi_gpu = compute_voronoi_cupy(mask, sampling=sampling)
             per_channel.append(
                 _cupy_array_to_torch(
                     voronoi_gpu, device=y.device, dtype=torch.int64
@@ -120,12 +121,13 @@ def get_voronoi(
     assert cc_assignments.dtype == torch.int64
     return cc_assignments
 
-def compute_voronoi_cupy(labels):
+def compute_voronoi_cupy(labels, sampling=None):
     """Generate GPU Voronoi partitions for a binary mask via CuPy distance transforms.
 
     Args:
         labels: Boolean-like array on GPU representing the foreground mask. Accepts
             PyTorch tensors, CuPy arrays, or objects exposing ``__cuda_array_interface__``.
+        sampling: Physical voxel spacing in spatial tensor order; None uses unit spacing.
     """
     # 1) Move input mask to GPU
     cc_gpu_in = _ensure_cupy_array(labels)
@@ -141,7 +143,7 @@ def compute_voronoi_cupy(labels):
     # 4) Compute GPU EDT (indices only) on the inverted mask
     inv_mask = labeled_cc == 0
     indices = cp_distance_transform_edt(
-        inv_mask, return_distances=False, return_indices=True, float64_distances=False,
+        inv_mask, sampling=sampling, return_distances=False, return_indices=True, float64_distances=False,
     )
 
     # 5) Assign each voxel the label of its nearest component

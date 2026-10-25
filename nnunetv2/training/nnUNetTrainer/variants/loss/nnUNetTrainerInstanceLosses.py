@@ -171,7 +171,11 @@ class nnUNetTrainerCCDiceCE(_InstanceTrainerBase):
     use_instance_loss = True
 
     def _build_instance_loss(self) -> nn.Module:
-        cc_loss = VectorizedCCLoss(activation=softmax_helper_dim1, mode="dice_ce")
+        cc_loss = VectorizedCCLoss(
+            activation=softmax_helper_dim1, mode="dice_ce",
+            sampling=self.configuration_manager.spacing,
+            patch_size=self.configuration_manager.patch_size,
+        )
         return cc_loss
 
 
@@ -189,7 +193,11 @@ class nnUNetTrainerGlobalCCDiceCE(_InstanceTrainerBase):
     use_instance_loss = True
 
     def _build_instance_loss(self) -> nn.Module:
-        cc_loss = VectorizedCCLoss(activation=softmax_helper_dim1, mode="dice_ce")
+        cc_loss = VectorizedCCLoss(
+            activation=softmax_helper_dim1, mode="dice_ce",
+            sampling=self.configuration_manager.spacing,
+            patch_size=self.configuration_manager.patch_size,
+        )
         return cc_loss
 
 
